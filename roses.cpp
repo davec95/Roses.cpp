@@ -367,6 +367,18 @@ static void pump_stdin(void)
 
 int main(void)
 {
+    // this binary is the compute core: it writes raw PPM frames
+    // to stdout, so running it straight in a terminal would dump
+    // binary garbage. refuse politely instead.
+    if (isatty(STDOUT_FILENO)) {
+        fprintf(stderr,
+            "roses: this is the compute core, not the app.\n"
+            "It streams PPM frames on stdout — run the display "
+            "shim instead:\n\n"
+            "    python3 display.py\n\n");
+        return 1;
+    }
+
     // reader (display shim) going away must not SIGPIPE us;
     // ferror(stdout) below handles it instead
     signal(SIGPIPE, SIG_IGN);
