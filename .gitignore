@@ -1,5 +1,6 @@
-# Compiled binary
+# Compiled binaries
 roses
+roses-tsan
 
 # Python bytecode
 __pycache__/
