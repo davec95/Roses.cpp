@@ -3,22 +3,25 @@
 C++ port of [Roses.py](https://github.com/davec95/Roses.py) —
 animated 8-particle rose attractor with CRT phosphor trails.
 
-**R2 (current): multithreaded.** `roses.cpp` is pure C++20
-standard library, no third-party dependencies. It contains all
-attractor math, density planes, tone-mapping, and rose history,
-and speaks a tiny pipe protocol (frames out on stdout, one-letter
-commands in on stdin). `display.py` is a thin tkinter shim that
-launches the binary, displays its frames, and forwards keypresses
-— the only Python in the repo, because C++ has no standard GUI.
+**R3 (current): native GUI + iteration report.** `roses.cpp` is
+C++20 standard library plus the system X11 libraries (Xlib +
+MIT-SHM, no third-party deps). Run `./roses` in a terminal and it
+opens its own window and renders straight into it — no Python
+needed. On exit it prints iterations/sec to stderr (1 iteration =
+1 frame = one full pass over all 8 color planes).
+
+`display.py` (tkinter) is now optional legacy: `./roses` piped
+still speaks the R1/R2 PPM protocol, so
+`./roses | python3 display.py --stdin` still works.
 
 ## Build & run
 
 ```sh
 make
-python3 display.py
+./roses          # native X11 window (needs DISPLAY)
 ```
 
-Controls are identical to roses.py: Space next rose, Backspace
+Controls are identical either way: Space next rose, Backspace
 previous, p phosphor toggle, f/F shading toggle (off = every hit
 pixel at full brightness), `-`/`=` persistence, Enter/Escape
 fullscreen, q quit.
@@ -38,4 +41,7 @@ main-only window while workers are parked at step-start.
 
 - **R1** single-threaded core + display shim
 - **R1.1** TTY guard on direct `./roses` runs
-- **R2** multithreaded: 8 workers, one per attractor (this check-in)
+- **R2** multithreaded: 8 workers, one per attractor
+- **R2.1** f/F shading toggle (flat = every hit at full brightness)
+- **R3** native X11 GUI mode (MIT-SHM blit, no shim) + iterations/sec
+  report on exit (this check-in)

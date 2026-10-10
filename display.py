@@ -19,17 +19,24 @@ Controls (identical to roses.py):
     Escape     leave fullscreen
     q          quit
 
-Usage: python3 display.py   (expects ./roses next to it)
+Usage: python3 display.py                 (launches ./roses itself)
+       ./roses | python3 display.py --stdin
+                                          (read frames from stdin;
+                                           keys are disabled — stdin
+                                           is the frame pipe)
 """
 
 import os
 import queue
 import subprocess
+import sys
 import threading
 import tkinter as tk
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CORE = os.path.join(HERE, "roses")
+
+STDIN_MODE = "--stdin" in sys.argv[1:]
 
 WINDOW_W = 1280
 WINDOW_H = 700
@@ -67,10 +74,10 @@ def send_resize():
 
 # --- frame reader (background thread: bytes only, no Tk calls) -----
 
-def read_exactly(n):
+def read_exactly(src, n):
     buf = b""
     while len(buf) < n:
-        chunk = core.stdout.read(n - len(buf))
+        chunk = src.read(n - len(buf))
         if not chunk:
             return None
         buf += chunk
@@ -78,8 +85,9 @@ def read_exactly(n):
 
 
 def reader():
+    src = sys.stdin.buffer if STDIN_MODE else core.stdout
     while True:
-        line = core.stdout.readline()
+        line = src.readline()
         if not line:
             break
         if not line.startswith(b"F "):
@@ -95,10 +103,10 @@ def reader():
             if len(parts) > 3 else ""
 
         # PPM header: magic, dims, maxval
-        header = (core.stdout.readline()
-                  + core.stdout.readline()
-                  + core.stdout.readline())
-        data = read_exactly(w * h * 3)
+        header = (src.readline()
+                  + src.readline()
+                  + src.readline())
+        data = read_exactly(src, w * h * 3)
         if data is None:
             break
 
@@ -198,17 +206,20 @@ root.protocol("WM_DELETE_WINDOW", quit_program)
 
 # --- launch core and run --------------------------------------------
 
-core = subprocess.Popen(
-    [CORE],
-    stdin=subprocess.PIPE,
-    stdout=subprocess.PIPE,
-)
+if STDIN_MODE:
+    core = None
+else:
+    core = subprocess.Popen(
+        [CORE],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
 
 threading.Thread(target=reader, daemon=True).start()
 root.after(1, pump)
 root.mainloop()
 
-if core.poll() is None:
+if core is not None and core.poll() is None:
     send("q")
     try:
         core.wait(timeout=2)

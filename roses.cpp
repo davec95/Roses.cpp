@@ -58,7 +58,25 @@
  * ---------------------------------------------------------------
  * PROTOCOL (core side)
  *
- *   stdout, one frame at a time:
+ * The core runs in one of two modes, chosen at startup:
+ *
+ *   GUI mode (stdout is a TTY and DISPLAY is set): the core opens
+ *   its own X11 window and renders directly into it via MIT-SHM
+ *   (XShmPutImage from a shared-memory XImage). No display shim,
+ *   no pipe. Keys are translated to the same commands listed
+ *   below; window resizes drive 'r', the window manager's close
+ *   button drives 'q', Enter/Escape toggle fullscreen.
+ *
+ *   Pipe mode (stdout redirected, e.g. by display.py): unchanged
+ *   R1/R2 protocol, frames out on stdout, commands in on stdin.
+ *
+ * On exit (either mode) the core prints its iteration rate to
+ * stderr. ONE ITERATION = one frame tick = one full pass over
+ * all 8 color planes (the 8 attractors run in parallel, one
+ * plane each; this is the unit the single-threaded Python
+ * original showed as "8 colors, then again").
+ *
+ *   stdout, one frame at a time (pipe mode only):
  *       F <w> <h> <title>\n          frame descriptor line
  *       P6\n<w> <h>\n255\n           PPM header
  *       <w*h*3 raw RGB bytes>        pixel data
@@ -92,11 +110,13 @@
 #include <algorithm>
 #include <atomic>
 #include <barrier>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <csignal>
 #include <deque>
 #include <random>
@@ -105,8 +125,16 @@
 #include <utility>
 #include <vector>
 
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/Xatom.h>
+#include <X11/keysym.h>
+#include <X11/extensions/XShm.h>
+
 #include <poll.h>
 #include <unistd.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 
 // --- window / attractor constants --------------------------------
 
@@ -170,7 +198,7 @@ static std::atomic<int>    decay_i{2};
 static std::atomic<bool>   shading{true};
 
 static std::deque<std::pair<double,double>> ab_buffer;  // history (main only)
-static int index = 0;                                    // cursor (main only)
+static int rose_index = 0;                                    // cursor (main only)
 
 static std::atomic<bool> quit_requested{false};
 
@@ -233,11 +261,11 @@ static void next_rose(void)
 {
     double ca = a.load(), cb = b.load();
 
-    if (index < (int)ab_buffer.size() - 1) {
+    if (rose_index < (int)ab_buffer.size() - 1) {
         // cursor not at newest: replay the buffered rose exactly
-        index++;
-        ca = ab_buffer[index].first;
-        cb = ab_buffer[index].second;
+        rose_index++;
+        ca = ab_buffer[rose_index].first;
+        cb = ab_buffer[rose_index].second;
     } else {
         // cursor at newest: THIS is where a new random rose is allowed
         ca = time_random(-1.0, 1.0);
@@ -247,7 +275,7 @@ static void next_rose(void)
         if ((int)ab_buffer.size() > BUFFER_SIZE)
             ab_buffer.pop_front();      // window full: drop oldest
 
-        index = (int)ab_buffer.size() - 1;
+        rose_index = (int)ab_buffer.size() - 1;
     }
 
     a.store(ca);
@@ -257,10 +285,10 @@ static void next_rose(void)
 
 static void back_rose(void)
 {
-    if (index > 0) {
-        index--;
-        a.store(ab_buffer[index].first);
-        b.store(ab_buffer[index].second);
+    if (rose_index > 0) {
+        rose_index--;
+        a.store(ab_buffer[rose_index].first);
+        b.store(ab_buffer[rose_index].second);
     }
     render();
 }
@@ -457,34 +485,327 @@ static void pump_stdin(void)
     }
 }
 
+// --- GUI mode: native X11 window ----------------------------------
+
+/*
+ * When stdout is a TTY and DISPLAY is set, the core opens its own
+ * window and blits the tone-mapped rgb buffer straight into it via
+ * MIT-SHM (XShmPutImage): the X server reads the pixels from a
+ * shared-memory segment, so there is no encode/decode round trip
+ * and no display shim. All input arrives as X events, translated
+ * to exactly the commands the pipe protocol accepts. Only the
+ * main thread ever touches Xlib, and only inside the main-only
+ * window between barriers, so resizes reallocating density/rgb
+ * remain race-free.
+ */
+
+struct Gui {
+    Display* dpy = nullptr;
+    int      scr = 0;
+    Window   win = 0;
+    Visual*  visual = nullptr;
+    int      depth = 0;
+    unsigned rmask = 0, gmask = 0, bmask = 0;
+    int      rshift = 0, gshift = 0, bshift = 0;
+
+    XImage*         img = nullptr;
+    XShmSegmentInfo shminfo;
+    bool            shm_ok = false;
+    bool            have_image = false;
+    uint8_t*        pixels = nullptr;    // 4 bytes/pixel, mask-packed
+
+    Atom wm_delete = None;
+    bool fullscreen = false;
+};
+
+static Gui  gui;
+static bool gui_mode = false;
+
+static bool gui_create_image(int w, int h);
+
+static int x_error_handler(Display*, XErrorEvent* ev)
+{
+    // benign races with the WM (stale geometry events, SHM BadMatch)
+    // must not kill the app: log and continue
+    char buf[128];
+    XGetErrorText(gui.dpy, (int)ev->error_code, buf, sizeof buf);
+    fprintf(stderr, "roses: X11: %s (ignored)\n", buf);
+    return 0;
+}
+
+static bool gui_init(int w, int h)
+{
+    gui.dpy = XOpenDisplay(nullptr);
+    if (!gui.dpy) {
+        fprintf(stderr, "roses: cannot open display '%s'\n",
+                XDisplayName(nullptr));
+        return false;
+    }
+    XSetErrorHandler(x_error_handler);
+
+    gui.scr = DefaultScreen(gui.dpy);
+
+    // TrueColor masks for the rgb24 -> native pixel conversion.
+    // The default Visual struct itself carries the channel masks;
+    // no XGetVisualInfo round trip needed (and its nitems_return
+    // must never be NULL -- passing NULL segfaults Xlib).
+    gui.visual = DefaultVisual(gui.dpy, gui.scr);
+    gui.depth  = DefaultDepth(gui.dpy, gui.scr);
+    gui.rmask  = gui.visual->red_mask;
+    gui.gmask  = gui.visual->green_mask;
+    gui.bmask  = gui.visual->blue_mask;
+
+    if (gui.depth < 24 || !gui.rmask || !gui.gmask || !gui.bmask) {
+        fprintf(stderr, "roses: need a >=24-bit TrueColor visual, "
+                        "got depth %d\n", gui.depth);
+        return false;
+    }
+    // masks are contiguous runs: shift = bit position of lowest set bit
+    gui.rshift = std::countr_zero(gui.rmask);
+    gui.gshift = std::countr_zero(gui.gmask);
+    gui.bshift = std::countr_zero(gui.bmask);
+
+    XSetWindowAttributes attrs;
+    attrs.background_pixel = BlackPixel(gui.dpy, gui.scr);
+    attrs.event_mask = KeyPressMask | ExposureMask |
+                       StructureNotifyMask | VisibilityChangeMask;
+    gui.win = XCreateWindow(gui.dpy, RootWindow(gui.dpy, gui.scr),
+        0, 0, (unsigned)w, (unsigned)h, 0,
+        (unsigned)gui.depth, InputOutput, gui.visual,
+        CWBackPixel | CWEventMask, &attrs);
+
+    gui.wm_delete = XInternAtom(gui.dpy, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(gui.dpy, gui.win, &gui.wm_delete, 1);
+
+    XStoreName(gui.dpy, gui.win, "Rose Attractor");
+
+    if (!gui_create_image(w, h)) return false;
+
+    XMapRaised(gui.dpy, gui.win);
+    XSetInputFocus(gui.dpy, gui.win, RevertToParent, CurrentTime);
+    XFlush(gui.dpy);
+    return true;
+}
+
+static void gui_destroy_image(void)
+{
+    if (!gui.have_image) return;
+    if (gui.shm_ok) {
+        XShmDetach(gui.dpy, &gui.shminfo);
+        XDestroyImage(gui.img);          // frees the XImage struct
+        shmdt(gui.shminfo.shmaddr);
+        shmctl(gui.shminfo.shmid, IPC_RMID, nullptr);
+    } else {
+        XDestroyImage(gui.img);          // frees its own byte buffer
+    }
+    gui.img = nullptr;
+    gui.pixels = nullptr;
+    gui.have_image = false;
+}
+
+static bool gui_create_image(int w, int h)
+{
+    gui_destroy_image();
+
+    gui.shm_ok = XShmQueryExtension(gui.dpy) ? true : false;
+
+    if (gui.shm_ok) {
+        // Xlib pads ZPixmap rows to 32 bits for depth>=24: a depth-24
+        // visual is 4 bytes per pixel on the wire, not 3.
+        size_t bytes = (size_t)w * h * (gui.depth >= 24 ? 4 : 2);
+        int shmid = shmget(IPC_PRIVATE, bytes, IPC_CREAT | 0777);
+        if (shmid < 0) {
+            gui.shm_ok = false;
+        } else {
+            gui.shminfo.shmid = shmid;
+            gui.shminfo.shmaddr =
+                (char*)shmat(shmid, nullptr, 0);
+            if (gui.shminfo.shmaddr == (char*)-1) {
+                gui.shm_ok = false;
+            } else {
+                gui.shminfo.readOnly = False;
+                gui.img = XShmCreateImage(gui.dpy, gui.visual,
+                    (unsigned)gui.depth, ZPixmap,
+                    gui.shminfo.shmaddr, &gui.shminfo,
+                    (unsigned)w, (unsigned)h);
+                if (!gui.img || !XShmAttach(gui.dpy, &gui.shminfo)) {
+                    if (gui.img) XDestroyImage(gui.img);
+                    shmdt(gui.shminfo.shmaddr);
+                    gui.shm_ok = false;
+                }
+            }
+            if (!gui.shm_ok) {
+                shmctl(shmid, IPC_RMID, nullptr);
+                gui.shminfo.shmaddr = nullptr;
+            }
+        }
+    }
+
+    if (!gui.shm_ok) {
+        // fallback: private buffer + XPutImage (slower, still correct)
+        gui.img = XCreateImage(gui.dpy, gui.visual,
+            (unsigned)gui.depth, ZPixmap, 0, nullptr,
+            (unsigned)w, (unsigned)h,
+            gui.depth >= 24 ? 32 : 16, 0);
+        if (!gui.img) {
+            fprintf(stderr, "roses: XCreateImage failed\n");
+            return false;
+        }
+        size_t bytes = (size_t)gui.img->bytes_per_line * (size_t)h;
+        gui.img->data = (char*)malloc(bytes);
+        if (!gui.img->data) {
+            fprintf(stderr, "roses: out of memory for XImage\n");
+            return false;
+        }
+    }
+
+    gui.pixels = (uint8_t*)gui.img->data;
+    gui.have_image = true;
+    return true;
+}
+
+static void gui_set_fullscreen(bool on)
+{
+    Atom state = XInternAtom(gui.dpy, "_NET_WM_STATE", False);
+    Atom fs    = XInternAtom(gui.dpy,
+                             "_NET_WM_STATE_FULLSCREEN", False);
+    unsigned long fs_val = (unsigned long)fs;
+    XChangeProperty(gui.dpy, gui.win, state, XA_ATOM, 32,
+        PropModeReplace, (const unsigned char*)&fs_val, on ? 1 : 0);
+    gui.fullscreen = on;
+    XFlush(gui.dpy);
+}
+
+static void gui_pump(void)
+{
+    while (XPending(gui.dpy)) {
+        XEvent ev;
+        XNextEvent(gui.dpy, &ev);
+
+        switch (ev.type) {
+        case KeyPress:
+            switch (XLookupKeysym(&ev.xkey, 0)) {
+            case XK_space:     next_rose();           break;
+            case XK_BackSpace: back_rose();           break;
+            case XK_p: case XK_P: toggle_phosphor();  break;
+            case XK_f: case XK_F: toggle_shading();   break;
+            case XK_minus:     shorter_persistence(); break;
+            case XK_equal:     longer_persistence();  break;
+            case XK_R:         render();              break;
+            case XK_Return: case XK_KP_Enter:
+                gui_set_fullscreen(true);             break;
+            case XK_Escape:
+                gui_set_fullscreen(false);            break;
+            case XK_q: case XK_Q:
+                quit_requested.store(true);           break;
+            default: break;
+            }
+            break;
+
+        case ConfigureNotify: {
+            int w = ev.xconfigure.width;
+            int h = ev.xconfigure.height;
+            if (w > 0 && h > 0 && (w != fb_w || h != fb_h)) {
+                create_accumulator(w, h);
+                if (!gui_create_image(w, h))
+                    quit_requested.store(true);
+            }
+            break;
+        }
+
+        case ClientMessage:
+            if ((Atom)ev.xclient.data.l[0] == gui.wm_delete)
+                quit_requested.store(true);
+            break;
+
+        // window gone under us (WM killed it, or no WM to forward
+        // WM_DELETE_WINDOW): there is nothing left to draw into
+        case DestroyNotify:
+        case UnmapNotify:
+            quit_requested.store(true);
+            break;
+
+        default:
+            break;
+        }
+    }
+}
+
+static void gui_blit(const char* title)
+{
+    // rgb24 -> native pixel words, using the visual's channel masks.
+    // Xlib pads ZPixmap to 32 bits/pixel for depth>=24, so follow
+    // the XImage's actual bits_per_pixel, not the window depth.
+    const size_t NP = (size_t)fb_w * fb_h;
+    if (gui.img->bits_per_pixel >= 32) {
+        uint32_t* dst = (uint32_t*)gui.pixels;
+        for (size_t p = 0; p < NP; p++) {
+            const uint8_t* s = &rgb[3 * p];
+            dst[p] = ((uint32_t)s[0] << gui.rshift) |
+                     ((uint32_t)s[1] << gui.gshift) |
+                     ((uint32_t)s[2] << gui.bshift);
+        }
+    } else {
+        uint8_t* dst = gui.pixels;
+        for (size_t p = 0; p < NP; p++) {
+            const uint8_t* s = &rgb[3 * p];
+            dst[3*p    ] = s[0];
+            dst[3*p + 1] = s[1];
+            dst[3*p + 2] = s[2];
+        }
+    }
+
+    if (gui.shm_ok)
+        XShmPutImage(gui.dpy, gui.win, DefaultGC(gui.dpy, gui.scr),
+                     gui.img, 0, 0, 0, 0,
+                     (unsigned)fb_w, (unsigned)fb_h, False);
+    else
+        XPutImage(gui.dpy, gui.win, DefaultGC(gui.dpy, gui.scr),
+                  gui.img, 0, 0, 0, 0,
+                  (unsigned)fb_w, (unsigned)fb_h);
+
+    XStoreName(gui.dpy, gui.win, title);
+    XFlush(gui.dpy);
+}
+
 // --- main ----------------------------------------------------------
 
 int main(void)
 {
-    // this binary is the compute core: it writes raw PPM frames
-    // to stdout, so running it straight in a terminal would dump
-    // binary garbage. refuse politely instead.
-    if (isatty(STDOUT_FILENO)) {
-        fprintf(stderr,
-            "roses: this is the compute core, not the app.\n"
-            "It streams PPM frames on stdout — run the display "
-            "shim instead:\n\n"
-            "    python3 display.py\n\n");
-        return 1;
+    // mode selection: a TTY stdout means a human at a terminal ->
+    // open our own X11 window. A redirected stdout means a display
+    // shim (display.py) is reading PPM frames off the pipe.
+    gui_mode = isatty(STDOUT_FILENO);
+
+    // framebuffer first: gui_init builds an XImage sized from fb_w/fb_h
+    create_accumulator(WINDOW_W, WINDOW_H);
+
+    if (gui_mode && !gui_init(WINDOW_W, WINDOW_H)) {
+        if (isatty(STDOUT_FILENO)) {
+            fprintf(stderr,
+                "roses: could not open a GUI window.\n"
+                "This binary is also the compute core: it can "
+                "stream PPM frames on stdout for a display shim:\n\n"
+                "    ./roses | python3 display.py --stdin\n\n");
+            return 1;
+        }
+        gui_mode = false;   // piped but X failed: pipe mode anyway
     }
 
     // reader (display shim) going away must not SIGPIPE us;
     // ferror(stdout) below handles it instead
     signal(SIGPIPE, SIG_IGN);
 
-    // first rose: index 0, saved into the buffer
+    // first rose: rose_index 0, saved into the buffer
     double a0 = time_random(-1.0, 1.0);
     a.store(a0);
     b.store(1.0 - a0);
     ab_buffer.push_back({ a0, 1.0 - a0 });
-    index = 0;
+    rose_index = 0;
 
     create_accumulator(WINDOW_W, WINDOW_H);
+    if (gui_mode && !gui_create_image(WINDOW_W, WINDOW_H))
+        return 1;
     render();
 
     // one worker thread per attractor: worker j owns particle j
@@ -493,10 +814,17 @@ int main(void)
     for (int j = 0; j < N_COLORS; j++)
         workers[j] = std::thread(worker, j);
 
+    // iteration counter: ONE iteration = one frame tick = one full
+    // pass over all 8 color planes (the unit the slow single-threaded
+    // Python original showed as "8 colors, then again")
+    uint64_t iterations = 0;
+    auto t_start = std::chrono::steady_clock::now();
+
     for (;;) {
         // main-only window: workers are parked at step-start, so
         // commands, resizes and reseeds touch shared state safely
-        pump_stdin();
+        if (gui_mode) gui_pump();
+        else          pump_stdin();
         if (quit_requested.load()) break;
 
         step_start.arrive_and_wait();   // release workers into phase 1
@@ -509,22 +837,28 @@ int main(void)
 
         tone_done.arrive_and_wait();    // all slices written
 
-        // emit frame: descriptor line + PPM
         char title[128];
         snprintf(title, sizeof title,
                  "Rose Attractor   #%d   a=%.6f   b=%.6f",
-                 index, a.load(), b.load());
+                 rose_index, a.load(), b.load());
 
-        char hdr[160];
-        int n = snprintf(hdr, sizeof hdr,
-                         "F %d %d %s\nP6\n%d %d\n255\n",
-                         fb_w, fb_h, title, fb_w, fb_h);
+        if (gui_mode) {
+            gui_blit(title);
+        } else {
+            // emit frame: descriptor line + PPM
+            char hdr[160];
+            int n = snprintf(hdr, sizeof hdr,
+                             "F %d %d %s\nP6\n%d %d\n255\n",
+                             fb_w, fb_h, title, fb_w, fb_h);
 
-        fwrite(hdr, 1, (size_t)n, stdout);
-        fwrite(rgb.data(), 1, NP * 3, stdout);
-        fflush(stdout);
+            fwrite(hdr, 1, (size_t)n, stdout);
+            fwrite(rgb.data(), 1, NP * 3, stdout);
+            fflush(stdout);
 
-        if (ferror(stdout)) break;   // display shim went away
+            if (ferror(stdout)) break;   // display shim went away
+        }
+
+        iterations++;
     }
 
     // wake the workers parked at step-start so they can observe
@@ -533,6 +867,22 @@ int main(void)
     step_start.arrive_and_wait();
     for (int j = 0; j < N_COLORS; j++)
         workers[j].join();
+
+    // exit report: iterations/second (stderr so pipe mode's stdout
+    // protocol stays clean)
+    auto t_end = std::chrono::steady_clock::now();
+    double secs = std::chrono::duration<double>(t_end - t_start).count();
+    if (secs > 0.0)
+        fprintf(stderr,
+                "\nroses: %llu iterations in %.1f s = %.1f iterations/sec"
+                "  (1 iteration = 1 frame = all 8 color planes)\n",
+                (unsigned long long)iterations, secs,
+                (double)iterations / secs);
+
+    if (gui_mode) {
+        gui_destroy_image();
+        XCloseDisplay(gui.dpy);
+    }
 
     return 0;
 }
