@@ -1,0 +1,9 @@
+# Compiled binary
+roses
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Local virtual environment
+.venv/
