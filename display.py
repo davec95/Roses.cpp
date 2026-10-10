@@ -12,6 +12,8 @@ Controls (identical to roses.py):
     Space      next rose
     Backspace  previous rose
     p          toggle phosphor trails (off = solid dots)
+    f / F      toggle shading/fading (off = every hit pixel lands
+               at full color/brightness, no glow or fade)
     - / =      phosphor shorter / longer persistence
     Enter      toggle fullscreen
     Escape     leave fullscreen
@@ -149,6 +151,10 @@ def toggle_phosphor(event=None):
     send("p")
 
 
+def toggle_shading(event=None):
+    send("f")
+
+
 def shorter_persistence(event=None):
     send("-")
 
@@ -182,6 +188,8 @@ root.bind("<BackSpace>", back_rose)
 root.bind("<Return>", toggle_fullscreen)
 root.bind("<Escape>", escape_fullscreen)
 root.bind("p", toggle_phosphor)
+root.bind("f", toggle_shading)
+root.bind("F", toggle_shading)
 root.bind("minus", shorter_persistence)
 root.bind("equal", longer_persistence)
 root.bind("q", quit_program)

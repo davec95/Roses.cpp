@@ -19,7 +19,8 @@ python3 display.py
 ```
 
 Controls are identical to roses.py: Space next rose, Backspace
-previous, p phosphor toggle, `-`/`=` persistence, Enter/Escape
+previous, p phosphor toggle, f/F shading toggle (off = every hit
+pixel at full brightness), `-`/`=` persistence, Enter/Escape
 fullscreen, q quit.
 
 ## Threading model (R2)

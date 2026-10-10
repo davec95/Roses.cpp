@@ -68,6 +68,9 @@
  *                    rose when the cursor is already newest)
  *       b            previous rose (walk cursor back)
  *       p            toggle phosphor trails (off = solid dots)
+ *       f            toggle flat shading (on = every hit pixel
+ *                    lands at full color/brightness, no glow
+ *                    tone-curve and no phosphor fade)
  *       -            phosphor shorter persistence
  *       =            phosphor longer persistence
  *       r <w> <h>    set framebuffer size (ignored if unchanged)
@@ -158,6 +161,13 @@ static std::atomic<double> a{0.0};
 static std::atomic<double> b{0.0};
 static std::atomic<bool>   phosphor{true};
 static std::atomic<int>    decay_i{2};
+
+// SHADING: the CRT look as a whole -- the glow tone-curve that
+// shades a pixel's brightness by its accumulated density, plus
+// the phosphor fade that dims old hits. When shading is OFF
+// (key f/F) neither applies: the plane is cleared each tick and
+// every pixel hit this tick lands at FULL color/brightness.
+static std::atomic<bool>   shading{true};
 
 static std::deque<std::pair<double,double>> ab_buffer;  // history (main only)
 static int index = 0;                                    // cursor (main only)
@@ -262,6 +272,14 @@ static void toggle_phosphor(void)
     std::fill(density.begin(), density.end(), 0.0f);
 }
 
+static void toggle_shading(void)
+{
+    shading.store(!shading.load());
+    // clear planes so stale faded pixels don't linger under the
+    // new mode: safe here, workers are parked at step-start
+    std::fill(density.begin(), density.end(), 0.0f);
+}
+
 static void shorter_persistence(void)
 {
     decay_i.store(std::max(0, decay_i.load() - 1));
@@ -284,6 +302,7 @@ static void longer_persistence(void)
 static void tone_map_range(size_t lo, size_t hi, size_t NP)
 {
     const bool ph = phosphor.load();
+    const bool sh = shading.load();
 
     for (size_t p = lo; p < hi; p++) {
         float r = 0.0f, g = 0.0f, bl = 0.0f;
@@ -292,9 +311,13 @@ static void tone_map_range(size_t lo, size_t hi, size_t NP)
             float d = density[(size_t)k * NP + p];
             if (d <= 0.0f) continue;
 
-            float inten = ph
-                ? 255.0f * (1.0f - expf(-d / GLOW_K))
-                : fminf(d, 1.0f) * 255.0f;
+            float inten;
+            if (!sh)
+                inten = 255.0f;               // flat: any hit = full color
+            else if (ph)
+                inten = 255.0f * (1.0f - expf(-d / GLOW_K));
+            else
+                inten = fminf(d, 1.0f) * 255.0f;
 
             r  += inten * COLOR_NORM[k][0];
             g  += inten * COLOR_NORM[k][1];
@@ -329,8 +352,12 @@ static void worker(int j)
         const double cb = b.load();
         float* plane = density.data() + (size_t)j * NP;
 
-        // phosphor decay: this plane dims a little each tick
-        if (phosphor.load()) {
+        // phosphor decay: this plane dims a little each tick.
+        // With shading off there is no fade: clear the plane so
+        // only this tick's hits show, at full brightness.
+        if (!shading.load()) {
+            std::fill(plane, plane + NP, 0.0f);
+        } else if (phosphor.load()) {
             const float k = DECAY_STEPS[decay_i.load()];
             for (size_t i = 0; i < NP; i++)
                 plane[i] *= k;
@@ -382,6 +409,7 @@ static void handle_line(const std::string& line)
     case 'n': next_rose();           break;
     case 'b': back_rose();           break;
     case 'p': toggle_phosphor();     break;
+    case 'f': case 'F': toggle_shading(); break;
     case '-': shorter_persistence(); break;
     case '=': longer_persistence();  break;
     case 'R': render();              break;
